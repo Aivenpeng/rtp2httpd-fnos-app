@@ -1,0 +1,166 @@
+name: Build rtp2httpd and package FPK
+
+# 一条龙：编译 x86_64 二进制 → 补齐官方 aarch64 → 回填 fnOS 包结构 → 打包成 FPK
+# 触发方式：Actions 标签页 → 选中本工作流 → Run workflow → 填版本号
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'rtp2httpd 版本号（不含 v），例如 3.17.2'
+        required: true
+        default: '3.17.2'
+      source_repo:
+        description: 'x86_64 源码仓库（改过源码就填你自己的 fork）'
+        required: true
+        default: 'stackia/rtp2httpd'
+      source_ref:
+        description: '源码 ref，留空则自动使用 v<version>'
+        required: false
+        default: ''
+      aarch64_from_official:
+        description: 'aarch64 是否直接下载官方二进制（不编译，推荐）'
+        required: true
+        default: 'true'
+
+permissions:
+  contents: read
+
+jobs:
+  build-x86:
+    name: 编译 x86_64 二进制
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      TARGET: x86_64-unknown-linux-musl
+      ARCH: x86_64
+    steps:
+      - name: 校验版本号
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "版本号必须是 x.y.z 格式，收到: $VERSION"
+            exit 1
+          fi
+
+      - name: 计算源码 ref
+        id: ref
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          ref="${SOURCE_REF:-v${VERSION}}"
+          echo "value=$ref" >> "$GITHUB_OUTPUT"
+          echo "使用源码 ref: $ref"
+
+      - name: 拉取 rtp2httpd 源码
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ steps.ref.outputs.value }}
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential wget xz-utils file
+
+      - name: 编译静态二进制
+        env:
+          TOOLCHAIN_PREFIX: ${{ env.TARGET }}
+          RELEASE_VERSION: ${{ env.VERSION }}
+        run: ./scripts/build-static.sh
+
+      - name: 整理产物
+        run: |
+          set -euo pipefail
+          BIN="build-${TARGET}-static/dist/usr/bin/rtp2httpd"
+          test -f "$BIN" || { echo "找不到编译产物: $BIN"; exit 1; }
+          file "$BIN"
+          cp "$BIN" "rtp2httpd-${VERSION}-${ARCH}"
+          chmod 0755 "rtp2httpd-${VERSION}-${ARCH}"
+          ls -lh "rtp2httpd-${VERSION}-${ARCH}"
+
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtp2httpd-${{ inputs.version }}-x86_64
+          path: rtp2httpd-${{ inputs.version }}-x86_64
+          if-no-files-found: error
+          retention-days: 7
+
+  package-fpk:
+    name: 回填并打包 FPK
+    needs: build-x86
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: 拉取 fnOS 打包仓库
+        uses: actions/checkout@v4
+
+      - name: 下载自己编译的 x86_64 二进制
+        uses: actions/download-artifact@v4
+        with:
+          name: rtp2httpd-${{ inputs.version }}-x86_64
+          path: binaries
+
+      - name: 下载官方 aarch64 二进制
+        if: ${{ inputs.aarch64_from_official == 'true' }}
+        env:
+          AARCH64_URL: https://github.com/stackia/rtp2httpd/releases/download/v${{ inputs.version }}/rtp2httpd-${{ inputs.version }}-aarch64
+        run: |
+          set -euo pipefail
+          mkdir -p binaries
+          curl -fL --retry 3 --connect-timeout 20 \
+            -o "binaries/rtp2httpd-${VERSION}-aarch64" "$AARCH64_URL"
+          chmod 0755 "binaries/rtp2httpd-${VERSION}-aarch64"
+          file "binaries/rtp2httpd-${VERSION}-aarch64"
+
+      - name: 回填二进制并更新版本号
+        env:
+          FETCH_AARCH64: ${{ inputs.aarch64_from_official }}
+        run: |
+          set -euo pipefail
+          SERVER_DIR="fnpack-root/app/server"
+          UPGRADE_DIR="${SERVER_DIR}/upgrade"
+          mkdir -p "$UPGRADE_DIR"
+
+          for arch in x86_64 aarch64; do
+            src="binaries/rtp2httpd-${VERSION}-${arch}"
+            if [ ! -f "$src" ]; then
+              if [ "$arch" = aarch64 ] && [ "$FETCH_AARCH64" != 'true' ]; then
+                echo "跳过 aarch64：未选择下载官方二进制（产物将不含新架构）"
+                continue
+              fi
+              echo "缺少二进制: $src"; exit 1
+            fi
+            cp "$src" "${SERVER_DIR}/rtp2httpd-${arch}"
+            cp "$src" "${UPGRADE_DIR}/rtp2httpd-${VERSION}-${arch}"
+            chmod 0755 "${SERVER_DIR}/rtp2httpd-${arch}" \
+                       "${UPGRADE_DIR}/rtp2httpd-${VERSION}-${arch}"
+          done
+
+          find "$UPGRADE_DIR" -maxdepth 1 -type f -name 'rtp2httpd-*-*' \
+            ! -name "rtp2httpd-${VERSION}-x86_64" \
+            ! -name "rtp2httpd-${VERSION}-aarch64" -delete
+
+          sed -i -E "s/rtp2httpd-[0-9]+\.[0-9]+\.[0-9]+-/rtp2httpd-${VERSION}-/g" \
+            fnpack-root/cmd/upgrade_init
+          sed -i -E "s/^(version[[:space:]]*=[[:space:]]*).*/\1${VERSION}/" \
+            fnpack-root/manifest
+          sed -i -E "s/(升级 rtp2httpd 版本到 )[0-9.]+/\1${VERSION}/" \
+            fnpack-root/manifest
+
+          echo '--- manifest version ---'
+          grep -E '^[[:space:]]*version[[:space:]]*=' fnpack-root/manifest
+          echo '--- upgrade_init ---'
+          grep 'upgrade/' fnpack-root/cmd/upgrade_init
+
+      - name: 打包 FPK（复用仓库自带 build.sh）
+        run: ./build.sh
+
+      - name: 上传 FPK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtp2httpd-fpk-${{ inputs.version }}
+          path: rtp2httpd-${{ inputs.version }}.*
+          if-no-files-found: error
+          retention-days: 30
